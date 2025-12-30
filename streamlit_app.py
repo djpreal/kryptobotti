@@ -1,147 +1,151 @@
 import streamlit as st
-import ccxt
-import numpy as np
-import requests
-import time
 import pandas as pd
+import ccxt
+import time
+import threading
+import json
+import os
+import requests
 from datetime import datetime
+import numpy as np
+import plotly.graph_objects as go
 
-# --- CONFIG ---
-st.set_page_config(page_title="MASTER v1.5.1 MOBILE", layout="centered")
-
-# Telegram-asetukset (Samat kuin työpöytäversiossa)
+# --- CONFIGURATIO ---
+STATE_FILE = "state.json"
+LOG_FILE = "trades.txt"
 T_TOKEN = "8098520195:AAFCpGPgYzwgMYs7v2WF-XegjunKyK7x04M"
 T_ID = "1388229604"
+
 exchange = ccxt.bitstamp({'enableRateLimit': True})
 
-def laheta_telegram(msg):
-    try:
-        requests.get(f"https://api.telegram.org/bot{T_TOKEN}/sendMessage", 
-                     params={"chat_id": T_ID, "text": msg, "parse_mode": "Markdown"}, timeout=5)
-    except: pass
-
-# --- SESSION STATE (Saldon ja lokien säilytys) ---
-if 'kassa' not in st.session_state:
-    st.session_state.kassa = 1000.0
-    st.session_state.btc = 0.0
-    st.session_state.max_val = 1000.0
-    st.session_state.logs = []
-
-# --- ANALYYSIFUNKTIO ---
-def aja_analyysi():
-    try:
-        ticker = exchange.fetch_ticker('BTC/EUR')
-        hinta = float(ticker['last'])
+class BotEngine:
+    def __init__(self):
+        self.load_state()
+        self.last_price = 0.0
+        self.ohlcv_data = [] 
+        self.is_running = False
+        self.auto_bot = False
+        self.commission = 0.004
         
-        # RSI-laskenta (1min kynttilät)
-        ohlcv = exchange.fetch_ohlcv('BTC/EUR', timeframe='1m', limit=21)
-        closes = np.array([x[4] for x in ohlcv])
-        deltas = np.diff(closes)
-        up = deltas[deltas >= 0].sum() / 14 if any(deltas >= 0) else 0.001
-        down = -deltas[deltas < 0].sum() / 14 if any(deltas < 0) else 0.001
-        rsi = 100 - (100 / (1 + (up/down)))
-        
-        return hinta, rsi
-    except:
-        return None, None
+        threading.Thread(target=self.price_loop, daemon=True).start()
+        threading.Thread(target=self.logic_loop, daemon=True).start()
 
-# --- UI ALKU ---
-st.title("🚀 MASTER v1.5.1")
+    def load_state(self):
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                d = json.load(f)
+                self.kassa = d.get("kassa", 1000.0)
+                self.btc_amount = d.get("btc", 0.0)
+                self.alkukassa = d.get("alku", 1000.0)
+        else:
+            self.kassa = 1000.0; self.btc_amount = 0.0; self.alkukassa = 1000.0
 
-# Sivupalkki asetuksille
-st.sidebar.header("Hallintapaneeli")
-alkusaldo = st.sidebar.number_input("Aseta alkukassa (€)", value=1000.0)
-if st.sidebar.button("Nollaa ja Resetoi"):
-    st.session_state.kassa = alkusaldo
-    st.session_state.btc = 0.0
-    st.session_state.max_val = alkusaldo
-    st.session_state.logs = []
+    def save_state(self):
+        with open(STATE_FILE, "w") as f:
+            json.dump({"kassa": self.kassa, "btc": self.btc_amount, "alku": self.alkukassa}, f)
+
+    def log_trade(self, msg):
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{datetime.now().strftime('%H:%M:%S')} - {msg}\n")
+
+    def price_loop(self):
+        while True:
+            try:
+                # Haetaan kynttilädata (1 min välein)
+                data = exchange.fetch_ohlcv('BTC/EUR', timeframe='1m', limit=30)
+                self.ohlcv_data = data
+                self.last_price = data[-1][4]
+            except: pass
+            time.sleep(10)
+
+    def execute_trade(self, mode, amount_eur, source="BOTTI"):
+        if self.last_price <= 0: return
+        if mode == "buy":
+            cost = amount_eur * (1 + self.commission)
+            if self.kassa >= cost:
+                bought_btc = amount_eur / self.last_price
+                self.kassa -= cost
+                self.btc_amount += bought_btc
+                self.save_state()
+                msg = f"🟢 OSTETTU: {amount_eur}€ ({source})"
+                self.log_trade(msg)
+            else: st.error("Ei tarpeeksi käteistä!")
+        elif mode == "sell":
+            current_btc_val = self.btc_amount * self.last_price
+            sell_eur = min(amount_eur, current_btc_val)
+            if sell_eur > 1.0:
+                sold_btc = sell_eur / self.last_price
+                net_cash = sell_eur * (1 - self.commission)
+                self.btc_amount -= sold_btc
+                self.kassa += net_cash
+                self.save_state()
+                msg = f"🔴 MYYTY: {sell_eur:.2f}€ ({source})"
+                self.log_trade(msg)
+
+    def logic_loop(self):
+        while True:
+            if self.is_running and self.auto_bot and self.last_price > 0:
+                try:
+                    closes = np.array([x[4] for x in self.ohlcv_data])
+                    deltas = np.diff(closes)
+                    up = deltas[deltas >= 0].sum() / 14 if any(deltas >= 0) else 0.1
+                    down = -deltas[deltas < 0].sum() / 14 if any(deltas < 0) else 0.1
+                    rsi = 100 - (100 / (1 + (up/down)))
+                    if rsi < 30: self.execute_trade("buy", 500, "AUTO-RSI")
+                    elif rsi > 70: self.execute_trade("sell", 500, "AUTO-RSI")
+                except: pass
+            time.sleep(30)
+
+# --- UI ---
+st.set_page_config(page_title="KRYPTO BOTTI PRO", layout="wide")
+
+if 'bot' not in st.session_state:
+    st.session_state.bot = BotEngine()
+
+bot = st.session_state.bot
+
+# Lasketaan arvot
+total_val = bot.kassa + (bot.btc_amount * bot.last_price)
+profit_pct = ((total_val / bot.alkukassa) - 1) * 100
+
+# Banneri ja Metrics
+st.title("₿ PERTUN KRYPTO BOTTI v1.6.5")
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("BTC HINTA", f"{bot.last_price:,.2f} €")
+m2.metric("SALKKU YHTEENSÄ", f"{total_val:,.2f} €", f"{profit_pct:+.2f} %")
+m3.metric("KÄTEINEN", f"{bot.kassa:,.2f} €")
+m4.metric("BTC OMISTUS", f"{bot.btc_amount:.6f}")
+
+# Kynttiläkaavio
+if bot.ohlcv_data:
+    df = pd.DataFrame(bot.ohlcv_data, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
+    df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+    
+    fig = go.Figure(data=[go.Candlestick(x=df['ts'],
+                open=df['open'], high=df['high'],
+                low=df['low'], close=df['close'],
+                increasing_line_color= '#22C55E', decreasing_line_color= '#EF4444')])
+    
+    fig.update_layout(template="plotly_dark", height=400, margin=dict(l=0, r=0, b=0, t=0))
+    st.plotly_chart(fig, use_container_width=True)
+
+# Ohjaimet
+st.sidebar.header("BOTIN HALLINTA")
+bot.is_running = st.sidebar.toggle("Seuranta Päällä", value=bot.is_running)
+bot.auto_bot = st.sidebar.toggle("RSI Automatiikka", value=bot.auto_bot)
+
+trade_amount = st.sidebar.slider("Kauppasumma (€)", 10, 2000, 500)
+if st.sidebar.button("↑ OSTA", use_container_width=True):
+    bot.execute_trade("buy", trade_amount, "MANUAL")
+if st.sidebar.button("↓ MYY", use_container_width=True):
+    bot.execute_trade("sell", trade_amount, "MANUAL")
+
+# Loki
+with st.expander("Näytä kauppahistoria"):
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "r") as f:
+            st.text("".join(f.readlines()[-15:]))
+
+if bot.is_running:
+    time.sleep(10)
     st.rerun()
-
-panos_eur = st.sidebar.slider("Automaattipanos (€)", 10, 2000, 500)
-botti_on = st.sidebar.toggle("AUTO-BOT AKTIIVINEN", value=False)
-
-# --- BOTIN AJAMINEN ---
-hinta, rsi = aja_analyysi()
-
-if hinta:
-    # 1. Stop-Loss tarkistus (-3%)
-    salkku_nyt = st.session_state.kassa + (st.session_state.btc * hinta)
-    if salkku_nyt > st.session_state.max_val:
-        st.session_state.max_val = salkku_nyt
-    
-    lasku = (salkku_nyt / st.session_state.max_val) - 1
-    if lasku <= -0.03 and st.session_state.btc > 0.000001:
-        myynti_eur = st.session_state.btc * hinta * 0.996
-        st.session_state.kassa += myynti_eur
-        st.session_state.btc = 0.0
-        st.session_state.logs.insert(0, f"🚨 STOP-LOSS! Myyty kaikki @ {hinta:.0f}€")
-        laheta_telegram("🚨 *STOP-LOSS LAUKESI PUHELIMESSA! Salkku suojattu.*")
-
-    # 2. Automaattiset kaupat
-    if botti_on:
-        if rsi < 31 and st.session_state.kassa >= panos_eur:
-            st.session_state.btc += (panos_eur / hinta)
-            st.session_state.kassa -= (panos_eur * 1.004)
-            st.session_state.logs.insert(0, f"🟢 OSTO (BOT): {panos_eur}€ @ {hinta:.0f}€")
-            laheta_telegram(f"🟢 OSTO: {panos_eur}€")
-        
-        elif rsi > 69 and st.session_state.btc > 0.000001:
-            # Trailing: myy 30%
-            myynti_btc = st.session_state.btc * 0.3
-            myynti_eur = myynti_btc * hinta * 0.996
-            st.session_state.btc -= myynti_btc
-            st.session_state.kassa += myynti_eur
-            st.session_state.logs.insert(0, f"🔴 MYYNTI (30% BOT): {myynti_eur:.2f}€ @ {hinta:.0f}€")
-            laheta_telegram(f"🔴 MYYNTI (30%): {myynti_eur:.2f}€")
-
-    # --- NÄYTTÖMETRIIKAT ---
-    c1, c2 = st.columns(2)
-    c1.metric("BTC HINTA", f"{hinta:,.2f} €")
-    c2.metric("RSI (1min)", f"{rsi:.1f}")
-
-    st.write("### Salkun tila")
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Käteinen", f"{st.session_state.kassa:.2f} €")
-    m2.metric("BTC", f"{st.session_state.btc:.5f}")
-    m3.metric("Yhteensä", f"{salkku_nyt:.2f} €", f"{salkku_nyt - alkusaldo:.2f} €")
-
-    st.divider()
-
-    # --- MANUAALINEN HALLINTA (Päivitetty) ---
-    st.subheader("Manuaalinen Ohjaus 🕹️")
-    
-    col_buy, col_sell = st.columns(2)
-
-    with col_buy:
-        summa = st.number_input("Osta summalla (€)", min_value=10.0, value=100.0, step=50.0)
-        if st.button("↑ OSTA NYT", use_container_width=True, type="primary"):
-            if st.session_state.kassa >= summa:
-                st.session_state.btc += (summa / hinta)
-                st.session_state.kassa -= (summa * 1.004)
-                st.session_state.logs.insert(0, f"🔵 MANUAALINEN OSTO: {summa}€")
-                laheta_telegram(f"🔵 MANUAALINEN OSTO: {summa}€")
-                st.rerun()
-            else:
-                st.error("Ei tarpeeksi käteistä!")
-
-    with col_sell:
-        prosentti = st.slider("Myy % määrästä", 0, 100, 100)
-        if st.button("↓ MYY VALITTU", use_container_width=True):
-            if st.session_state.btc > 0:
-                myynti_btc = st.session_state.btc * (prosentti / 100)
-                myynti_eur = myynti_btc * hinta * 0.996
-                st.session_state.btc -= myynti_btc
-                st.session_state.kassa += myynti_eur
-                st.session_state.logs.insert(0, f"⚪ MANUAALINEN MYYNTI: {prosentti}%")
-                laheta_telegram(f"⚪ MANUAALINEN MYYNTI: {prosentti}%")
-                st.rerun()
-
-    st.divider()
-    st.subheader("Tapahtumaloki")
-    for log in st.session_state.logs[:8]:
-        st.write(log)
-
-# Automaattinen päivitys (sivu latautuu uudelleen 10s välein)
-time.sleep(10)
-st.rerun()
